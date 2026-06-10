@@ -189,6 +189,42 @@ void initRtc()
   RTC.CLKSEL = RTC_CLKSEL_INT1K_gc;
 }
 
+uint16_t readVccMillivolts()
+{
+  // ADC0 is shared with the PTC touch engine, which the RTC PIT ISR drives
+  // continuously. Pause it (and let any in-flight conversion finish) so we own
+  // the ADC for this read, then hand it back.
+  const bool ptcWasRunning = shouldProcessPtc;
+  disableRtc();
+  while (ADC0.COMMAND & ADC_STCONV_bm) { }
+
+  // Reference = VDD, input = internal 1.1 V reference, so the result is
+  // RES = 1.1V / VDD * 1024 and therefore VDD = 1.1V * 1024 / RES.
+  VREF.CTRLA = (VREF.CTRLA & ~VREF_ADC0REFSEL_gm) | VREF_ADC0REFSEL_1V1_gc;
+  VREF.CTRLB |= VREF_ADC0REFEN_bm;
+  ADC0.CTRLC = (ADC0.CTRLC & ~ADC_REFSEL_gm) | ADC_REFSEL_VDDREF_gc;
+  ADC0.MUXPOS = ADC_MUXPOS_INTREF_gc;
+  ADC0.CTRLA |= ADC_ENABLE_bm;
+  delayMicroseconds(50);                  // let the reference settle
+
+  ADC0.COMMAND = ADC_STCONV_bm;           // throwaway after the mux change
+  while (ADC0.COMMAND & ADC_STCONV_bm) { }
+  ADC0.COMMAND = ADC_STCONV_bm;
+  while (ADC0.COMMAND & ADC_STCONV_bm) { }
+
+  const uint16_t reading = ADC0.RES;
+
+  if (ptcWasRunning) {
+    enableRtcPtc();                        // PTC reconfigures the ADC on its next pass
+  }
+
+  if (reading == 0) {
+    return 0;
+  }
+
+  return (uint16_t)(1126400UL / reading); // 1.1V * 1024 * 1000, in millivolts
+}
+
 void enableRebootOnButton()
 {
   PORTA.PIN3CTRL = PORT_PULLUPEN_bm | PORT_ISC_LEVEL_gc;
@@ -1096,18 +1132,6 @@ uint8_t knightRider(uint16_t step, uint8_t red, uint8_t green, uint8_t blue)
   return 100;
 }
 
-uint8_t nuclearMode(uint16_t step, uint8_t spacing, uint8_t r, uint8_t g, uint8_t b, uint8_t r2, uint8_t g2, uint8_t b2, uint8_t ret )
-{
-  uint8_t initial = step % 3;
-  setAllLeds(r,g,b);
-  for (uint8_t i = 0 + initial; i < 18; i = i + spacing)
-  {
-    ledStrip.setPixelColor(i, r2, g2, b2);
-  }
-  ledStrip.show();
-  return ret;
-}
-
 uint8_t breath(uint16_t step, uint8_t r, uint8_t g, uint8_t b )
 {
   step = step % 60;
@@ -1295,6 +1319,70 @@ uint8_t splitMode(uint16_t step)
   return 200;
 }
 
+// Saltire (St Andrew's Cross): a blue field with a white diagonal cross.
+// The white indices are a first-pass guess for the round 9-LED eyes (left eye
+// is 0..8, right eye 9..17) - expect to tweak this list once it's lit on a
+// real badge so the whites actually read as an X.
+const uint8_t SALTIRE_WHITE[] PROGMEM = {
+  2, 0, 8, 6,        // left eye: ends + centre of the two diagonals
+  11, 13, 15, 17,    // right eye: mirror
+};
+
+uint8_t saltireMode(uint16_t step)
+{
+  (void)step;
+
+  setAllLeds(0, 0, 30);   // blue field
+
+  for (uint8_t i = 0; i < sizeof(SALTIRE_WHITE); ++i) {
+    ledStrip.setPixelColor(pgm_read_byte(&SALTIRE_WHITE[i]), 24, 24, 24);
+  }
+
+  ledStrip.show();
+  return 200;
+}
+
+uint8_t batteryMode(uint16_t step)
+{
+  // 2x CR2032 in parallel: ~2900 mV fresh, ~2200 mV flat. Tune to taste.
+  static const uint16_t EMPTY_MV = 2200;
+  static const uint16_t FULL_MV = 2900;
+
+  // Battery voltage barely moves frame-to-frame, so sample occasionally and
+  // hold the gauge between samples (each read briefly pauses touch sensing).
+  static uint16_t millivolts = 0;
+  if ((step % 50) == 0) {
+    millivolts = readVccMillivolts();
+  }
+
+  uint16_t clamped = millivolts;
+  if (clamped < EMPTY_MV) clamped = EMPTY_MV;
+  if (clamped > FULL_MV) clamped = FULL_MV;
+
+  // Map the voltage onto 0..9 lit LEDs per eye (rounded).
+  const uint16_t span = FULL_MV - EMPTY_MV;
+  const uint8_t ledsLit = (uint8_t)(((uint32_t)(clamped - EMPTY_MV) * 9 + span / 2) / span);
+
+  // Green when healthy, amber when getting low, red when nearly flat.
+  uint8_t red, green, blue;
+  if (ledsLit >= 6) {
+    red = 0;  green = 18; blue = 0;
+  } else if (ledsLit >= 3) {
+    red = 20; green = 10; blue = 0;
+  } else {
+    red = 22; green = 0;  blue = 0;
+  }
+
+  setAllLeds(COLOR_OFF);
+  for (uint8_t ledIndex = 0; ledIndex < ledsLit; ++ledIndex) {
+    ledStrip.setPixelColor(ledIndex, red, green, blue);  // left eye fills 0..8
+    setRightEyeLed(ledIndex, red, green, blue);          // right eye mirrors it
+  }
+  ledStrip.show();
+
+  return 120;
+}
+
 int runAnimationMode(uint8_t mode, uint16_t step)
 {
   switch (mode) {
@@ -1311,11 +1399,9 @@ int runAnimationMode(uint8_t mode, uint16_t step)
     case 5:
       return 0;  // freed: devsecopsMode removed to make room for morseMode (mode 11)
     case 6:
-      if ((state & B00000010) != 0) { return 0; };
-      return nuclearMode(step, 3, 0, 0, 0, 10, 20, 0, 150 );
+      return batteryMode(step);     // was nuclearMode (green/dots)
     case 7:
-      if ((state & B00000100) != 0) { return 0; };
-      return nuclearMode(4, 3, 12, 20, 255, 0, 2, 0, 250 ); // york rose
+      return saltireMode(step);     // was nuclearMode (york rose)
     case 8:
       return 0;  // freed: policeMode removed for extra flash headroom
     case 9:
@@ -1377,7 +1463,7 @@ void handleWakeButtonPress(
         playFindTheSequenceTwoPlayer();
         break;
       case RIGHT_GREEN_MASK:
-        playFollowTheSequenceTwoPlayer();
+        animationMode = 6;    // hold right-green + tap wake -> battery indicator
         break;
     }
   }
